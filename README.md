@@ -28,8 +28,10 @@
 3. [クライアント接続の受け入れ](#2-クライアント接続の受け入れ)
 4. [データの読み書きループ](#3-データの読み書きループサーバーの主な処理)
 5. [RESP プロトコルパーサーの詳細](#resp-redis-serialization-protocol-パーサーの詳細解説)
-6. [実行方法とテスト](#実行方法とテスト)
-7. [トラブルシューティング](#トラブルシューティング)
+6. [RESP Writer（レスポンス送信）の詳細解説](#resp-writerレスポンス送信の詳細解説)
+7. [Redis コマンドハンドラーの実装](#redis-コマンドハンドラーの実装)
+8. [実行方法とテスト](#実行方法とテスト)
+9. [トラブルシューティング](#トラブルシューティング)
 
 ---
 
@@ -37,15 +39,17 @@
 
 ```
 build-your-own-redis-go/
-├── main.go          # TCPサーバーのメインロジック
-├── resp.go          # RESPプロトコルパーサー
+├── main.go          # TCPサーバーのメインロジックとコマンド処理
+├── resp.go          # RESPプロトコルパーサーとWriter
+├── handler.go       # Redisコマンドハンドラー（PING、SET、GET、HSET、HGET）
 └── README.md        # このファイル
 ```
 
 ### ファイルの役割
 
-- **main.go**: TCP サーバーの起動、クライアント接続の受け入れ、通信ループの管理
-- **resp.go**: RESP プロトコルで送信されるデータの解析（パース）機能
+- **main.go**: TCP サーバーの起動、クライアント接続の受け入れ、コマンド処理ループ
+- **resp.go**: RESP プロトコルで送信されるデータの解析（パース）とシリアライズ機能
+- **handler.go**: Redis コマンドの実装（PING、SET、GET、HSET、HGET）とデータストア管理
 - **README.md**: プロジェクトの詳細な説明と学習ガイド
 
 ---
@@ -965,16 +969,374 @@ for {
 
 ---
 
-## 7. 実行方法とテスト
+## Redis コマンドハンドラーの実装
 
-### 7.1 サーバーの起動
+これまでに **シリアライザ（Serializer）** を作成し、クライアントからコマンドを受け取ったあとにどのように応答するかを学びました。
+
+ここからは **CommandsHandler** を構築し、いくつかの Redis コマンドを実際に実装していきます。
+
+### 7.1 コマンドハンドラーの概要
+
+**コマンドハンドラーの役割:**
+
+- クライアントから受け取ったコマンドを解析
+- コマンド名に応じて適切な処理関数を呼び出し
+- 処理結果を RESP 形式でクライアントに返送
+
+**リクエストの構造:**
+
+- クライアントから受け取るリクエストは **RESP の配列（Array）** 形式
+- 最初の要素が「コマンド名」
+- 残りの要素が「引数」
+
+**例: `SET name Ahmed` コマンドの場合:**
+
+```go
+Value{
+    typ: "array",
+    array: []Value{
+        Value{typ: "bulk", bulk: "SET"},      // コマンド名
+        Value{typ: "bulk", bulk: "name"},    // 引数1（キー）
+        Value{typ: "bulk", bulk: "Ahmed"},   // 引数2（値）
+    },
+}
+```
+
+### 7.2 ハンドラーマップの定義
+
+```go
+var Handlers = map[string]func([]Value) Value{
+    "PING": ping,
+    "SET":  set,
+    "GET":  get,
+    "HSET": hset,
+    "HGET": hget,
+}
+```
+
+**ハンドラーマップの特徴:**
+
+- コマンド名（大文字）をキーとして、対応する処理関数をマッピング
+- Redis のコマンドは大文字小文字を区別しないため、大文字で統一
+- 各ハンドラー関数は `[]Value`（引数の配列）を受け取り、`Value`（結果）を返す
+
+### 7.3 PING コマンドの実装
+
+**PING コマンドの仕様:**
+
+- 引数なし: `PONG` を返す
+- 引数あり: その引数をそのまま返す
+
+```go
+func ping(args []Value) Value {
+    // 引数が提供されていない場合 (例: PING)
+    if len(args) == 0 {
+        return Value{typ: "string", str: "PONG"}
+    }
+    // 引数が提供された場合 (例: PING hello)
+    return Value{typ: "string", str: args[0].bulk}
+}
+```
+
+**使用例:**
+
+- `PING` → `+PONG\r\n`
+- `PING hello` → `+hello\r\n`
+
+### 7.4 SET と GET コマンドの実装
+
+#### 7.4.1 データストアの定義
+
+```go
+// SET/GET コマンド用のデータストア
+var SETs = map[string]string{}
+var SETsMu = sync.RWMutex{} // 並行アクセス制御用
+```
+
+**データストアの特徴:**
+
+- `map[string]string`: キーと値のペアを保存
+- `sync.RWMutex`: 複数のゴルーチンからの同時アクセスを制御
+- 読み取り操作は並行実行可能、書き込み操作は排他的
+
+#### 7.4.2 SET コマンド
+
+```go
+func set(args []Value) Value {
+    // 引数の数（キーと値の2つ）が正しいか検証
+    if len(args) != 2 {
+        return Value{typ: "error", str: "ERR wrong number of arguments for 'set' command"}
+    }
+
+    key := args[0].bulk   // キー
+    value := args[1].bulk // 値
+
+    // 書き込み操作のため排他ロックを取得
+    SETsMu.Lock()
+    SETs[key] = value
+    SETsMu.Unlock()
+
+    return Value{typ: "string", str: "OK"}
+}
+```
+
+**SET コマンドの処理:**
+
+1. 引数の数を検証（2 つ必要）
+2. キーと値を抽出
+3. 排他ロックを取得してデータストアに保存
+4. 成功応答 `OK` を返す
+
+#### 7.4.3 GET コマンド
+
+```go
+func get(args []Value) Value {
+    // 引数の数（キーの1つ）が正しいか検証
+    if len(args) != 1 {
+        return Value{typ: "error", str: "ERR wrong number of arguments for 'get' command"}
+    }
+
+    key := args[0].bulk
+
+    // 読み取り操作のため読み取りロックを取得
+    SETsMu.RLock()
+    value, ok := SETs[key]
+    SETsMu.RUnlock()
+
+    // キーが存在しなかった場合
+    if !ok {
+        return Value{typ: "null"}
+    }
+
+    // 値が存在した場合、Bulk Stringとして返す
+    return Value{typ: "bulk", bulk: value}
+}
+```
+
+**GET コマンドの処理:**
+
+1. 引数の数を検証（1 つ必要）
+2. キーを抽出
+3. 読み取りロックを取得してデータストアから検索
+4. キーが存在しない場合は `null` を返す
+5. キーが存在する場合は値を `bulk` として返す
+
+### 7.5 HSET と HGET コマンドの実装
+
+#### 7.5.1 ハッシュデータストアの定義
+
+```go
+// HSET/HGET コマンド用のデータストア
+var HSETs = map[string]map[string]string{}
+var HSETsMu = sync.RWMutex{}
+```
+
+**ハッシュデータストアの特徴:**
+
+- `map[string]map[string]string`: ハッシュ名 → フィールドと値のマップ
+- Redis の Hash 型を模倣
+- 二重構造でネストしたハッシュを実現
+
+**データ構造の例:**
+
+```go
+{
+    "users": {
+        "u1": "Ahmed",
+        "u2": "Mohamed",
+    },
+    "posts": {
+        "p1": "Hello World",
+        "p2": "Welcome to my blog",
+    },
+}
+```
+
+#### 7.5.2 HSET コマンド
+
+```go
+func hset(args []Value) Value {
+    // 引数の数（ハッシュ名、キー、値の3つ）が正しいか検証
+    if len(args) != 3 {
+        return Value{typ: "error", str: "ERR wrong number of arguments for 'hset' command"}
+    }
+
+    hash := args[0].bulk  // ハッシュ名（例: "users"）
+    key := args[1].bulk   // フィールドキー（例: "u1"）
+    value := args[2].bulk // 値（例: "Ahmed"）
+
+    HSETsMu.Lock()
+    // ハッシュ名がまだ存在しない場合、新しい内部マップを作成
+    if _, ok := HSETs[hash]; !ok {
+        HSETs[hash] = map[string]string{}
+    }
+    // 指定されたハッシュの内部マップにキーと値を保存
+    HSETs[hash][key] = value
+    HSETsMu.Unlock()
+
+    return Value{typ: "string", str: "OK"}
+}
+```
+
+**HSET コマンドの処理:**
+
+1. 引数の数を検証（3 つ必要）
+2. ハッシュ名、フィールドキー、値を抽出
+3. 排他ロックを取得
+4. ハッシュが存在しない場合は新規作成
+5. ハッシュ内のフィールドに値を設定
+6. 成功応答 `OK` を返す
+
+**使用例:**
+
+- `HSET users u1 Ahmed` → ユーザー "Ahmed" を ID "u1" で保存
+- `HSET posts p1 "Hello World"` → 投稿 "Hello World" を ID "p1" で保存
+
+#### 7.5.3 HGET コマンド
+
+```go
+func hget(args []Value) Value {
+    // 引数の数（ハッシュ名、キーの2つ）が正しいか検証
+    if len(args) != 2 {
+        return Value{typ: "error", str: "ERR wrong number of arguments for 'hget' command"}
+    }
+
+    hash := args[0].bulk // ハッシュ名
+    key := args[1].bulk  // フィールドキー
+
+    HSETsMu.RLock()
+    // 指定されたハッシュの内部マップから値を取得
+    value, ok := HSETs[hash][key]
+    HSETsMu.RUnlock()
+
+    // キーが存在しなかった場合（ハッシュ自体が存在しない場合も含む）
+    if !ok {
+        return Value{typ: "null"}
+    }
+
+    // 値が存在した場合、Bulk Stringとして返す
+    return Value{typ: "bulk", bulk: value}
+}
+```
+
+**HGET コマンドの処理:**
+
+1. 引数の数を検証（2 つ必要）
+2. ハッシュ名とフィールドキーを抽出
+3. 読み取りロックを取得してハッシュ内のフィールドを検索
+4. フィールドが存在しない場合は `null` を返す
+5. フィールドが存在する場合は値を `bulk` として返す
+
+**使用例:**
+
+- `HGET users u1` → "Ahmed" を返す
+- `HGET posts p1` → "Hello World" を返す
+
+### 7.6 main.go でのコマンド処理
+
+```go
+for {
+    // --- リクエストの読み取りとパース ---
+    resp := NewResp(conn)
+    value, err := resp.Read()
+    if err != nil {
+        fmt.Println(err)
+        return
+    }
+
+    // --- リクエストの検証 ---
+    // Redisコマンドは必ずRESP Array（配列）である必要があります
+    if value.typ != "array" {
+        fmt.Println("Invalid request, expected array")
+        continue
+    }
+
+    // 配列が空であってはなりません（最低でもコマンド名が必要）
+    if len(value.array) == 0 {
+        fmt.Println("Invalid request, expected array length > 0")
+        continue
+    }
+
+    // --- コマンド名と引数の抽出 ---
+    // 配列の最初の要素がコマンド名です。それを大文字に変換します
+    command := strings.ToUpper(value.array[0].bulk)
+    // 配列の2番目以降の要素すべてを引数（args）としてスライス
+    args := value.array[1:]
+
+    // --- コマンドの実行と応答 ---
+    writer := NewWriter(conn)
+
+    // Handlersマップから、コマンド名に対応するハンドラー関数を検索
+    handler, ok := Handlers[command]
+    if !ok {
+        // コマンドが見つからなかった場合
+        fmt.Println("Invalid command: ", command)
+        // エラー応答をクライアントに返します
+        writer.Write(Value{typ: "error", str: fmt.Sprintf("ERR unknown command '%s'", command)})
+        continue
+    }
+
+    // ハンドラー関数を実行し、引数（args）を渡して、結果（RESP Value）を受け取ります
+    result := handler(args)
+
+    // 実行結果（Value）を Writer.Write() で RESP バイト列に変換し、クライアントに送信
+    writer.Write(result)
+}
+```
+
+**コマンド処理の流れ:**
+
+1. **リクエスト読み取り**: RESP パーサーでクライアントからのデータを解析
+2. **リクエスト検証**: 配列形式であることを確認
+3. **コマンド抽出**: 最初の要素をコマンド名、残りを引数として抽出
+4. **ハンドラー検索**: コマンド名に対応するハンドラー関数を検索
+5. **コマンド実行**: ハンドラー関数を実行して結果を取得
+6. **レスポンス送信**: Writer で結果を RESP 形式に変換してクライアントに送信
+
+### 7.7 並行処理とスレッドセーフティ
+
+**RWMutex の使用理由:**
+
+- 複数のクライアントが同時に接続する可能性を考慮
+- 読み取り操作は並行実行可能（`RLock()`）
+- 書き込み操作は排他的（`Lock()`）
+- データの整合性を保証
+
+**ロックの取得と解放:**
+
+- `Lock()` / `Unlock()`: 書き込み操作用
+- `RLock()` / `RUnlock()`: 読み取り操作用
+- `defer` を使った確実なロック解放
+
+### 7.8 エラーハンドリング
+
+**引数検証:**
+
+- 各コマンドで必要な引数の数をチェック
+- 不正な引数数の場合はエラー応答を返す
+
+**未知のコマンド:**
+
+- ハンドラーマップに存在しないコマンドの場合
+- `ERR unknown command` エラーを返す
+
+**データの存在確認:**
+
+- GET/HGET でキーが存在しない場合
+- `null` 応答を返す（Redis の標準的な動作）
+
+---
+
+## 8. 実行方法とテスト
+
+### 8.1 サーバーの起動
 
 ```bash
 # プロジェクトディレクトリに移動
 cd /path/to/build-your-own-redis-go
 
 # Goプログラムを実行
-go run main.go resp.go
+go run main.go resp.go handler.go
 ```
 
 **期待される出力:**
@@ -983,7 +1345,7 @@ go run main.go resp.go
 Listening on port :6379
 ```
 
-### 7.2 クライアントでのテスト
+### 8.2 クライアントでのテスト
 
 **別のターミナルで redis-cli を使用:**
 
@@ -993,33 +1355,50 @@ redis-cli -p 6379
 
 # コマンドを送信
 127.0.0.1:6379> PING
+PONG
+127.0.0.1:6379> PING hello
+hello
+127.0.0.1:6379> SET name Ahmed
 OK
-127.0.0.1:6379> SET key value
+127.0.0.1:6379> GET name
+Ahmed
+127.0.0.1:6379> GET nonexistent
+(nil)
+127.0.0.1:6379> HSET users u1 Ahmed
 OK
-127.0.0.1:6379> GET key
-OK
+127.0.0.1:6379> HGET users u1
+Ahmed
+127.0.0.1:6379> HGET users u2
+(nil)
 ```
 
 **サーバー側の出力例:**
 
 ```
 {array [{bulk PING}]}
-{array [{bulk SET} {bulk key} {bulk value}]}
-{array [{bulk GET} {bulk key}]}
+{array [{bulk PING} {bulk hello}]}
+{array [{bulk SET} {bulk name} {bulk Ahmed}]}
+{array [{bulk GET} {bulk name}]}
+{array [{bulk GET} {bulk nonexistent}]}
+{array [{bulk HSET} {bulk users} {bulk u1} {bulk Ahmed}]}
+{array [{bulk HGET} {bulk users} {bulk u1}]}
+{array [{bulk HGET} {bulk users} {bulk u2}]}
 ```
 
-### 7.3 telnet でのテスト
+### 8.3 telnet でのテスト
 
 ```bash
 # telnetで接続
 telnet localhost 6379
 
 # RESP形式でコマンドを送信
-*2
+*3
+$3
+SET
 $4
-PING
-$4
-TEST
+name
+$5
+Ahmed
 ```
 
 **期待される応答:**
@@ -1030,9 +1409,9 @@ TEST
 
 ---
 
-## 8. トラブルシューティング
+## 9. トラブルシューティング
 
-### 8.1 よくある問題
+### 9.1 よくある問題
 
 **ポートが既に使用されている:**
 
@@ -1058,13 +1437,13 @@ dial tcp 127.0.0.1:6379: connect: connection refused
 
 - 解決方法: サーバーが起動しているか確認
 
-### 8.2 デバッグのヒント
+### 9.2 デバッグのヒント
 
 1. **サーバー側のログを確認**: 受信したデータが正しくパースされているか
 2. **ネットワーク接続を確認**: `netstat -an | grep 6379`でポートの状態を確認
 3. **クライアント側のエラーを確認**: redis-cli のエラーメッセージを確認
 
-### 8.3 パフォーマンスの考慮事項
+### 9.3 パフォーマンスの考慮事項
 
 - この実装は教育目的のため、パフォーマンスは最適化されていません
 - 実際の本番環境では、並行処理（ゴルーチン）やコネクションプールの使用を検討
@@ -1072,13 +1451,15 @@ dial tcp 127.0.0.1:6379: connect: connection refused
 
 ---
 
-## 9. 参考資料・関連リンク
+## 10. 参考資料・関連リンク
 
 - **[Build Redis from scratch](https://www.build-redis-from-scratch.dev/en/introduction)**: このプロジェクトの主要な参考資料
 - **[Writing RESP](https://www.build-redis-from-scratch.dev/en/resp-writer)**: RESP Writer の実装に関する詳細なチュートリアル
+- **[Redis Commands](https://www.build-redis-from-scratch.dev/en/redis-commands)**: Redis コマンドハンドラーの実装に関するチュートリアル
 - **[Redis Protocol Specification](https://redis.io/docs/latest/develop/reference/protocol-spec/)**: RESP プロトコルの公式仕様
 - **[Go net package documentation](https://pkg.go.dev/net)**: Go 言語のネットワークプログラミング
 - **[bufio package documentation](https://pkg.go.dev/bufio)**: Go 言語のバッファリング I/O
+- **[sync package documentation](https://pkg.go.dev/sync)**: Go 言語の並行処理と同期
 
 ### さらなる学習のために
 

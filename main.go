@@ -1,14 +1,14 @@
 package main // プログラムの実行を開始するメインパッケージを宣言します。
 
 import (
-	"fmt" // フォーマットされたI/O（主にメッセージ出力）を行うためのパッケージです。
-	"net" // ネットワークI/O（TCP/UDP通信など）を扱うためのパッケージです。
+	"fmt"     // フォーマットされたI/O（主にメッセージ出力）を行うためのパッケージです。
+	"net"     // ネットワークI/O（TCP通信など）を扱うためのパッケージです。
+	"strings" // 文字列操作（コマンド名を大文字に変換するなど）のためのパッケージです。
 )
 
 // main関数は、プログラムが実行されたときに最初に呼び出される特別な関数です。
 func main() {
 	// サーバーが待ち受けを開始することをコンソールに出力します。
-	// Redisの標準ポートである6379番を使います。
 	fmt.Println("Listening on port :6379")
 
 	// ----------------------------------------------------
@@ -43,41 +43,67 @@ func main() {
 	defer conn.Close()
 
 	// ----------------------------------------------------
-	// 3. 通信ループ（データの読み書き）
+	// 3. 通信ループ：リクエストの処理と応答
 	// ----------------------------------------------------
 
 	// クライアントとの接続が確立された後、データを継続的に処理するための無限ループに入ります。
 	for {
-		// --- データの読み取り (Read) ---
+		// --- リクエストの読み取りとパース ---
 
 		// 接続 (conn) を使って新しい RESP パーサー（リーダー）を作成します。
 		resp := NewResp(conn)
 
-		// resp.Read() を呼び出して、クライアントから送られてきたRESP形式のデータを読み取り、Value構造体にパースします。
+		// クライアントから送られてきたRESP形式のデータを読み取り、Value構造体にパースします。
 		value, err := resp.Read()
 		if err != nil {
-			// データ読み取り中にエラーが発生した場合（クライアント切断など）は、ループを抜けてプログラムを終了します。
+			// データ読み取り中にエラーが発生した場合（クライアント切断など）は、ループを終了します。
 			fmt.Println(err)
 			return
 		}
 
-		// _ = value
-		// 受信した Value を変数に代入していますが、このサーバーはリクエスト内容を無視するため、
-		// 変数を使っていないことによるコンパイラ警告を避けるために `_ =` で代入しています。
-		_ = value
+		// --- リクエストの検証 ---
 
-		// --- 応答の書き出し (Write) ---
+		// Redisコマンドは必ずRESP Array（配列）である必要があります。
+		if value.typ != "array" {
+			fmt.Println("Invalid request, expected array")
+			// 処理をスキップして次のリクエストを待ちます。
+			continue
+		}
+
+		// 配列が空であってはなりません（最低でもコマンド名が必要です）。
+		if len(value.array) == 0 {
+			fmt.Println("Invalid request, expected array length > 0")
+			continue
+		}
+
+		// --- コマンド名と引数の抽出 ---
+
+		// 配列の最初の要素がコマンド名です。それを大文字に変換します（Redisはコマンド名で大文字小文字を区別しません）。
+		// .bulk を使うのは、コマンド名が常に Bulk String（例: $3\r\nSET\r\n）として送られてくるためです。
+		command := strings.ToUpper(value.array[0].bulk)
+
+		// 配列の2番目以降の要素すべてを引数（args）としてスライスします。
+		args := value.array[1:]
+
+		// --- コマンドの実行と応答 ---
 
 		// 接続 (conn) を使って新しい RESP Writer（書き出し側）を作成します。
 		writer := NewWriter(conn)
 
-		// Simple String の "OK" に対応する Value 構造体を作成し、Writerに渡して送信します。
-		// Writer.Write() の内部で Value は "+OK\r\n" という RESPバイト列に変換され、クライアントに送信されます。
-		err = writer.Write(Value{typ: "string", str: "OK"})
-		if err != nil {
-			// 書き込みエラーが発生した場合もプログラムを終了します。
-			fmt.Println(err)
-			return
+		// Handlersマップから、コマンド名に対応するハンドラー関数を検索します。
+		handler, ok := Handlers[command]
+		if !ok {
+			// コマンドが見つからなかった場合
+			fmt.Println("Invalid command: ", command)
+			// エラー応答をクライアントに返します。
+			writer.Write(Value{typ: "error", str: fmt.Sprintf("ERR unknown command '%s'", command)})
+			continue
 		}
+
+		// ハンドラー関数を実行し、引数（args）を渡して、結果（RESP Value）を受け取ります。
+		result := handler(args)
+
+		// 実行結果（Value）を Writer.Write() で RESP バイト列に変換し、クライアントに送信します。
+		writer.Write(result)
 	}
 }
