@@ -4,6 +4,8 @@
 
 この **Golang** のプログラムは、非常にシンプルな **TCPサーバー** として機能し、**Redis** の通信プロトコルである **RESP (REdis Serialization Protocol)** を使ってクライアントからの命令を受け取り、固定の応答を返す一連の流れを実装しています。
 
+> **参考資料**: このプロジェクトは [Build Redis from scratch](https://www.build-redis-from-scratch.dev/en/introduction) のチュートリアルを参考に作成されています。Redisの内部動作を理解し、データベースの低レベルな詳細を学習することを目的としています。
+
 ### 学習目標
 - TCPサーバーの基本的な仕組みを理解する
 - RESPプロトコルの解析方法を学ぶ
@@ -685,3 +687,22 @@ dial tcp 127.0.0.1:6379: connect: connection refused
 - この実装は教育目的のため、パフォーマンスは最適化されていません
 - 実際の本番環境では、並行処理（ゴルーチン）やコネクションプールの使用を検討
 - バッファサイズの調整やメモリプールの使用も有効
+
+---
+
+## 参考資料・関連リンク
+
+- **[Build Redis from scratch](https://www.build-redis-from-scratch.dev/en/introduction)**: このプロジェクトの主要な参考資料
+- **[Redis Protocol Specification](https://redis.io/docs/reference/protocol-spec/)**: RESPプロトコルの公式仕様
+- **[Go net package documentation](https://pkg.go.dev/net)**: Go言語のネットワークプログラミング
+- **[bufio package documentation](https://pkg.go.dev/bufio)**: Go言語のバッファリングI/O
+
+### さらなる学習のために
+
+このプロジェクトは、Redisの内部動作を理解するための第一歩です。より高度な機能を実装したい場合は、以下の要素を追加することを検討してください：
+
+- **データ永続化**: AOF（Append Only File）やRDBファイルの実装
+- **複数データ型**: 文字列、ハッシュ、リスト、セット、ソート済みセットのサポート
+- **並行処理**: ゴルーチンを使った複数接続の同時処理
+- **メモリ管理**: 効率的なデータ構造とメモリ使用量の最適化
+- **コマンド処理**: 実際のRedisコマンドの実装
