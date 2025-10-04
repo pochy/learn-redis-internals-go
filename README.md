@@ -30,8 +30,9 @@
 5. [RESP プロトコルパーサーの詳細](#resp-redis-serialization-protocol-パーサーの詳細解説)
 6. [RESP Writer（レスポンス送信）の詳細解説](#resp-writerレスポンス送信の詳細解説)
 7. [Redis コマンドハンドラーの実装](#redis-コマンドハンドラーの実装)
-8. [実行方法とテスト](#実行方法とテスト)
-9. [トラブルシューティング](#トラブルシューティング)
+8. [AOF（Append Only File）による永続化](#aofappend-only-fileによる永続化)
+9. [実行方法とテスト](#実行方法とテスト)
+10. [トラブルシューティング](#トラブルシューティング)
 
 ---
 
@@ -42,14 +43,18 @@ build-your-own-redis-go/
 ├── main.go          # TCPサーバーのメインロジックとコマンド処理
 ├── resp.go          # RESPプロトコルパーサーとWriter
 ├── handler.go       # Redisコマンドハンドラー（PING、SET、GET、HSET、HGET）
+├── aof.go           # AOF（Append Only File）による永続化機能
+├── database.aof     # データ永続化ファイル（自動生成）
 └── README.md        # このファイル
 ```
 
 ### ファイルの役割
 
-- **main.go**: TCP サーバーの起動、クライアント接続の受け入れ、コマンド処理ループ
+- **main.go**: TCP サーバーの起動、クライアント接続の受け入れ、コマンド処理ループ、AOF の初期化とデータ復元
 - **resp.go**: RESP プロトコルで送信されるデータの解析（パース）とシリアライズ機能
 - **handler.go**: Redis コマンドの実装（PING、SET、GET、HSET、HGET）とデータストア管理
+- **aof.go**: AOF（Append Only File）によるデータ永続化機能の実装
+- **database.aof**: データ永続化ファイル（サーバー起動時に自動生成、コマンド実行時に更新）
 - **README.md**: プロジェクトの詳細な説明と学習ガイド
 
 ---
@@ -1327,16 +1332,414 @@ for {
 
 ---
 
-## 8. 実行方法とテスト
+## 8. AOF（Append Only File）による永続化
 
-### 8.1 サーバーの起動
+これまでのセクションで、私たちは **インメモリデータベース（InMemory Database）** を実装し、**RESP プロトコル**を使って Redis 互換の動作を実現しました。
+
+このセクションでは、データベースに **データ永続化（persistence）** を適用します。
+
+### 8.1 永続化の重要性
+
+**データ永続化とは:**
+
+- サーバーのクラッシュや再起動時にもデータを失わない機能
+- インメモリ型データベースでも重要な機能
+- データの耐久性（durability）を提供
+
+**なぜ永続化が必要なのか:**
+
+- サーバーの予期しない停止や再起動
+- メモリの揮発性によるデータ損失の防止
+- 本格的なデータベースとしての機能提供
+
+### 8.2 Redis の永続化方式
+
+**RDB（Redis Database）:**
+
+- 設定に基づいて定期的に作成されるデータのスナップショット
+- 例：「3 分ごと」や「10 分ごと」にメモリ内のデータを丸ごとコピー
+- クラッシュ時は RDB ファイルからデータを再読み込み
+
+**AOF（Append Only File）:**
+
+- Redis が受け取った各コマンドを **RESP 形式**でファイルに逐次追記
+- 再起動時には AOF ファイル内のコマンドをすべて読み込み、順番に実行してメモリ上に復元
+- **このプロジェクトで実装する方式**
+
+### 8.3 AOF の仕組み
+
+**AOF の動作原理:**
+
+1. コマンドが実行されるたびに、その RESP 形式の表現をファイルに記録
+2. サーバー起動時には AOF ファイルを読み取り、各コマンドを再実行
+3. メモリ上にデータを再構築
+
+**AOF ファイルのフォーマット例:**
+
+```
+*3
+$3
+set
+$4
+name
+$5
+ahmed
+*3
+$3
+set
+$7
+website
+$20
+ahmedash95.github.io
+```
+
+### 8.4 AOF 構造体の実装
+
+#### 8.4.1 Aof 構造体の定義
+
+```go
+type Aof struct {
+    file *os.File      // ディスク上のファイルオブジェクト
+    rd   *bufio.Reader // ファイルから効率的に読み取るためのリーダー
+    mu   sync.Mutex    // ファイルへの書き込みを排他的にするためのMutex
+}
+```
+
+**構造体の役割:**
+
+- `file`: ディスク上のファイルオブジェクト（読み書き用）
+- `rd`: ファイルから効率的に読み取るためのバッファ付きリーダー
+- `mu`: ファイルへの書き込みを排他的にするための Mutex（並行処理制御）
+
+#### 8.4.2 NewAof 関数（コンストラクタ）
+
+```go
+func NewAof(path string) (*Aof, error) {
+    // ファイルが存在しなければ作成し、読み書きモードで開きます
+    f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0666)
+    if err != nil {
+        return nil, err
+    }
+
+    aof := &Aof{
+        file: f,
+        rd:   bufio.NewReader(f),
+    }
+
+    // 1秒ごとにAOFをディスクに同期するためのゴルーチンを開始
+    go func() {
+        for {
+            aof.mu.Lock()
+            err := aof.file.Sync() // ファイルの変更を強制的にディスクに書き込み
+            if err != nil {
+                fmt.Println("Error syncing AOF file:", err)
+            }
+            aof.mu.Unlock()
+            time.Sleep(time.Second)
+        }
+    }()
+
+    return aof, nil
+}
+```
+
+**処理の詳細:**
+
+1. **ファイルの作成・開封**: `os.OpenFile`でファイルが存在しなければ作成、存在すれば開く
+2. **バッファ付きリーダーの初期化**: `bufio.NewReader`で効率的な読み取りを実現
+3. **同期ゴルーチンの開始**: 1 秒ごとにファイルをディスクに同期
+
+**同期の重要性:**
+
+- 1 秒ごとの同期により、変更内容が常にディスクに反映される
+- 同期を行わないと、いつディスクに書き込むかは OS の判断に任される
+- クラッシュが起きても失うのは最大で 1 秒分のデータだけ
+
+#### 8.4.3 Close メソッド
+
+```go
+func (aof *Aof) Close() error {
+    aof.mu.Lock()
+    defer aof.mu.Unlock()
+    return aof.file.Close()
+}
+```
+
+**役割:**
+
+- サーバー終了時にファイルを安全に閉じる
+- Mutex を安全に解放
+- リソースの適切なクリーンアップ
+
+#### 8.4.4 Write メソッド
+
+```go
+func (aof *Aof) Write(value Value) error {
+    aof.mu.Lock()
+    defer aof.mu.Unlock()
+
+    // ValueオブジェクトをRESPバイト列にマーシャリング
+    _, err := aof.file.Write(value.Marshal())
+    if err != nil {
+        return err
+    }
+    return nil
+}
+```
+
+**処理の流れ:**
+
+1. **排他ロックの取得**: 書き込み中の他の操作をブロック
+2. **RESP 形式への変換**: `value.Marshal()`で Value を RESP バイト列に変換
+3. **ファイルへの書き込み**: 変換したバイト列を AOF ファイルに追記
+4. **エラーハンドリング**: 書き込みエラーがあれば返す
+
+**なぜ RESP 形式で保存するのか:**
+
+- 後でファイルを読み込む際、この RESP をそのまま再利用してデータを復元できる
+- パーサーとライターの既存の機能を活用
+- データ形式の一貫性を保つ
+
+#### 8.4.5 Read メソッド
+
+```go
+func (aof *Aof) Read(callback func(value Value)) error {
+    aof.mu.Lock()
+    defer aof.mu.Unlock()
+
+    // ファイルの読み取りを最初から開始するために、ポインターを先頭に戻す
+    _, err := aof.file.Seek(0, 0)
+    if err != nil {
+        return err
+    }
+
+    // ファイルリーダーを使って新しいRESPパーサーを作成
+    resp := NewResp(aof.file)
+
+    // EOF（ファイルの終端）に達するまでループし、コマンドを一つずつ読み取る
+    for {
+        value, err := resp.Read()
+        if err == nil {
+            callback(value)
+        }
+        if err == io.EOF {
+            break
+        }
+        if err != nil {
+            return err
+        }
+    }
+    return nil
+}
+```
+
+**処理の詳細:**
+
+1. **排他ロックの取得**: 読み取り中の書き込みをブロック
+2. **ファイルポインタのリセット**: `Seek(0, 0)`でファイルの先頭に移動
+3. **RESP パーサーの作成**: ファイルを読み取るためのパーサーを作成
+4. **コマンドの逐次読み取り**: EOF までループしてコマンドを一つずつ読み取り
+5. **コールバック関数の実行**: 読み取ったコマンドごとにコールバック関数を実行
+
+**コールバック関数の役割:**
+
+- 読み取ったコマンドを処理する関数を外部から指定
+- サーバー起動時のデータ復元に使用
+- 柔軟な処理の実現
+
+### 8.5 main.go での AOF 統合
+
+#### 8.5.1 AOF の初期化とデータ復元
+
+```go
+func main() {
+    fmt.Println("Listening on port :6379")
+
+    // AOF構造体を初期化し、ファイル（database.aof）を開く
+    aof, err := NewAof("database.aof")
+    if err != nil {
+        fmt.Println("Error initializing AOF:", err)
+        return
+    }
+    defer aof.Close() // サーバー終了時にAOFファイルを閉じることを保証
+
+    // AOFファイルを読み込み、保存されているコマンドを再実行してメモリにデータを復元
+    aof.Read(func(value Value) {
+        // AOFから読み込んだコマンドを抽出し、大文字に変換
+        command := strings.ToUpper(value.array[0].bulk)
+        args := value.array[1:]
+
+        // ハンドラーを検索
+        handler, ok := Handlers[command]
+        if !ok {
+            fmt.Printf("AOF Read: Invalid command '%s' found. Skipping.\n", command)
+            return
+        }
+
+        // ハンドラーを実行し、メモリ上のデータストアを再構築
+        // この処理ではクライアントへの応答は不要なので結果は無視
+        handler(args)
+    })
+
+    // ... (サーバーの起動処理) ...
+}
+```
+
+**データ復元の流れ:**
+
+1. **AOF ファイルの開封**: `database.aof`ファイルを開く
+2. **コマンドの読み取り**: AOF ファイルからコマンドを一つずつ読み取り
+3. **コマンドの再実行**: 読み取ったコマンドをハンドラーで実行
+4. **メモリの再構築**: データストア（SETs、HSETs）を復元
+
+#### 8.5.2 コマンド実行時の AOF への追記
+
+```go
+for {
+    // ... (リクエストの読み取りと検証) ...
+
+    // 書き込みコマンド（SET, HSETなど）の場合、AOFファイルにRESP形式で追記
+    if command == "SET" || command == "HSET" {
+        // 永続化が必要なコマンドのみを書き込み
+        if err := aof.Write(value); err != nil {
+            fmt.Println("AOF Write error:", err)
+            // AOFへの書き込み失敗時も、コマンド自体は実行されたものとして進める
+        }
+    }
+
+    // ハンドラー関数を実行し、引数（args）を渡して、結果（RESP Value）を受け取る
+    result := handler(args)
+
+    // 実行結果（Value）を Writer.Write() で RESP バイト列に変換し、クライアントに送信
+    writer.Write(result)
+}
+```
+
+**AOF への書き込み条件:**
+
+- **SET コマンド**: キーと値のペアを保存するコマンド
+- **HSET コマンド**: ハッシュのフィールドを設定するコマンド
+- **GET/HGET コマンド**: 読み取り専用コマンドは永続化しない
+
+**なぜ読み取りコマンドは永続化しないのか:**
+
+- データの変更を伴わないため、永続化の必要がない
+- ファイルサイズの無駄な増加を防ぐ
+- パフォーマンスの向上
+
+### 8.6 AOF ファイルの例
+
+**コマンド実行例:**
+
+```bash
+SET name Ahmed
+SET website ahmedash95.github.io
+HSET users u1 Ahmed
+HSET users u2 Mohamed
+```
+
+**AOF ファイルの内容:**
+
+```
+*3
+$3
+set
+$4
+name
+$5
+ahmed
+*3
+$3
+set
+$7
+website
+$20
+ahmedash95.github.io
+*4
+$4
+hset
+$5
+users
+$2
+u1
+$5
+ahmed
+*4
+$4
+hset
+$5
+users
+$2
+u2
+$7
+mohamed
+```
+
+### 8.7 AOF の利点と制限
+
+**利点:**
+
+- **データの永続性**: サーバー再起動後もデータが保持される
+- **シンプルな実装**: RESP 形式をそのまま使用
+- **デバッグの容易さ**: ファイル内容を直接確認可能
+- **段階的な復元**: コマンドを順番に再実行してデータを復元
+
+**制限:**
+
+- **ファイルサイズの増加**: 時間とともにファイルが大きくなる
+- **復元時間**: 大量のコマンドがある場合、起動時間が長くなる
+- **ディスク I/O**: 書き込み操作のたびにディスクアクセスが発生
+
+### 8.8 実際の動作確認
+
+**1. サーバーの起動:**
+
+```bash
+go run main.go resp.go handler.go aof.go
+```
+
+**2. データの設定:**
+
+```bash
+redis-cli -p 6379
+127.0.0.1:6379> SET name Ahmed
+OK
+127.0.0.1:6379> HSET users u1 Ahmed
+OK
+```
+
+**3. サーバーの再起動:**
+
+- サーバーを停止（Ctrl+C）
+- 再度起動
+
+**4. データの確認:**
+
+```bash
+redis-cli -p 6379
+127.0.0.1:6379> GET name
+Ahmed
+127.0.0.1:6379> HGET users u1
+Ahmed
+```
+
+**期待される結果:**
+
+- サーバー再起動後もデータが保持されている
+- AOF ファイル（database.aof）にコマンドが記録されている
+
+---
+
+## 9. 実行方法とテスト
+
+### 9.1 サーバーの起動
 
 ```bash
 # プロジェクトディレクトリに移動
 cd /path/to/build-your-own-redis-go
 
-# Goプログラムを実行
-go run main.go resp.go handler.go
+# Goプログラムを実行（AOFファイルを含む）
+go run main.go resp.go handler.go aof.go
 ```
 
 **期待される出力:**
@@ -1345,7 +1748,7 @@ go run main.go resp.go handler.go
 Listening on port :6379
 ```
 
-### 8.2 クライアントでのテスト
+### 9.2 クライアントでのテスト
 
 **別のターミナルで redis-cli を使用:**
 
@@ -1385,7 +1788,47 @@ Ahmed
 {array [{bulk HGET} {bulk users} {bulk u2}]}
 ```
 
-### 8.3 telnet でのテスト
+### 9.3 AOF による永続化のテスト
+
+**1. データの設定:**
+
+```bash
+redis-cli -p 6379
+127.0.0.1:6379> SET name Ahmed
+OK
+127.0.0.1:6379> SET website ahmedash95.github.io
+OK
+127.0.0.1:6379> HSET users u1 Ahmed
+OK
+127.0.0.1:6379> HSET users u2 Mohamed
+OK
+```
+
+**2. サーバーの再起動:**
+
+- サーバーを停止（Ctrl+C）
+- 再度起動: `go run main.go resp.go handler.go aof.go`
+
+**3. データの確認:**
+
+```bash
+redis-cli -p 6379
+127.0.0.1:6379> GET name
+Ahmed
+127.0.0.1:6379> GET website
+ahmedash95.github.io
+127.0.0.1:6379> HGET users u1
+Ahmed
+127.0.0.1:6379> HGET users u2
+Mohamed
+```
+
+**期待される結果:**
+
+- サーバー再起動後もデータが保持されている
+- AOF ファイル（database.aof）にコマンドが記録されている
+
+### 9.4 telnet でのテスト
 
 ```bash
 # telnetで接続
@@ -1409,9 +1852,9 @@ Ahmed
 
 ---
 
-## 9. トラブルシューティング
+## 10. トラブルシューティング
 
-### 9.1 よくある問題
+### 10.1 よくある問題
 
 **ポートが既に使用されている:**
 
@@ -1437,13 +1880,13 @@ dial tcp 127.0.0.1:6379: connect: connection refused
 
 - 解決方法: サーバーが起動しているか確認
 
-### 9.2 デバッグのヒント
+### 10.2 デバッグのヒント
 
 1. **サーバー側のログを確認**: 受信したデータが正しくパースされているか
 2. **ネットワーク接続を確認**: `netstat -an | grep 6379`でポートの状態を確認
 3. **クライアント側のエラーを確認**: redis-cli のエラーメッセージを確認
 
-### 9.3 パフォーマンスの考慮事項
+### 10.3 パフォーマンスの考慮事項
 
 - この実装は教育目的のため、パフォーマンスは最適化されていません
 - 実際の本番環境では、並行処理（ゴルーチン）やコネクションプールの使用を検討
@@ -1451,22 +1894,26 @@ dial tcp 127.0.0.1:6379: connect: connection refused
 
 ---
 
-## 10. 参考資料・関連リンク
+## 11. 参考資料・関連リンク
 
 - **[Build Redis from scratch](https://www.build-redis-from-scratch.dev/en/introduction)**: このプロジェクトの主要な参考資料
 - **[Writing RESP](https://www.build-redis-from-scratch.dev/en/resp-writer)**: RESP Writer の実装に関する詳細なチュートリアル
 - **[Redis Commands](https://www.build-redis-from-scratch.dev/en/implementing-commands)**: Redis コマンドハンドラーの実装に関するチュートリアル
+- **[AOF Persistence](https://www.build-redis-from-scratch.dev/en/aof-persistence)**: AOF（Append Only File）による永続化の実装に関するチュートリアル
 - **[Redis Protocol Specification](https://redis.io/docs/latest/develop/reference/protocol-spec/)**: RESP プロトコルの公式仕様
 - **[Go net package documentation](https://pkg.go.dev/net)**: Go 言語のネットワークプログラミング
 - **[bufio package documentation](https://pkg.go.dev/bufio)**: Go 言語のバッファリング I/O
 - **[sync package documentation](https://pkg.go.dev/sync)**: Go 言語の並行処理と同期
+- **[os package documentation](https://pkg.go.dev/os)**: Go 言語のファイル操作
 
 ### さらなる学習のために
 
 このプロジェクトは、Redis の内部動作を理解するための第一歩です。より高度な機能を実装したい場合は、以下の要素を追加することを検討してください：
 
-- **データ永続化**: AOF（Append Only File）や RDB ファイルの実装
+- **データ永続化**: AOF（Append Only File）や RDB ファイルの実装 ✅ **実装済み**
 - **複数データ型**: 文字列、ハッシュ、リスト、セット、ソート済みセットのサポート
 - **並行処理**: ゴルーチンを使った複数接続の同時処理
 - **メモリ管理**: 効率的なデータ構造とメモリ使用量の最適化
 - **コマンド処理**: 実際の Redis コマンドの実装
+- **レプリケーション**: マスター・スレーブ構成の実装
+- **クラスタリング**: 複数ノードでの分散処理
