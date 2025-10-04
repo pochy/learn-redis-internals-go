@@ -693,7 +693,7 @@ dial tcp 127.0.0.1:6379: connect: connection refused
 ## 参考資料・関連リンク
 
 - **[Build Redis from scratch](https://www.build-redis-from-scratch.dev/en/introduction)**: このプロジェクトの主要な参考資料
-- **[Redis Protocol Specification](https://redis.io/docs/reference/protocol-spec/)**: RESPプロトコルの公式仕様
+- **[Redis Protocol Specification](https://redis.io/docs/latest/develop/reference/protocol-spec/)**: RESPプロトコルの公式仕様
 - **[Go net package documentation](https://pkg.go.dev/net)**: Go言語のネットワークプログラミング
 - **[bufio package documentation](https://pkg.go.dev/bufio)**: Go言語のバッファリングI/O
 
